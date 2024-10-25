@@ -1,0 +1,9 @@
+{
+    "token": "TU_TOKEN_DE_DISCORD",
+    "prefix": "!",
+    "language": "es-ES",
+    "vad_aggressiveness": 3,
+    "silence_duration": 900,
+    "sample_rate": 16000,
+    "log_level": "INFO"
+  }

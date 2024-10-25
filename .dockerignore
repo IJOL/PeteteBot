@@ -1,0 +1,10 @@
+# .dockerignore
+__pycache__
+*.pyc
+.env
+.git
+.gitignore
+.vscode
+*.log
+google_credentials.json
+config.json

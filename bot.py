@@ -120,6 +120,7 @@ class TranscriberCog(commands.Cog):
         self.bot = bot
         self.recording = {}
         self.segment_handlers = {}
+        self.channel = None
 
     @commands.command()
     async def join(self, ctx):
@@ -127,7 +128,7 @@ class TranscriberCog(commands.Cog):
             if ctx.author.voice:
                 channel = ctx.author.voice.channel
                 if ctx.voice_client is None:
-                    await channel.connect()
+                    self.channel = await channel.connect()
                 else:
                     await ctx.voice_client.move_to(channel)
                 self.segment_handlers[ctx.guild.id] = AudioSegmentHandler(self.bot, ctx.channel)
@@ -169,9 +170,12 @@ class TranscriberCog(commands.Cog):
                         and handler.current_segment):
                         asyncio.create_task(handler.process_audio_buffer(handler.current_segment))
                         handler.current_segment = []
-
-            # Reemplazar ctx.voice_client.listen(audio_receiver) con el método correcto
-            ctx.voice_client.recv_voice_packet(audio_receiver)
+            if self.channel:
+                self.channel.listen(audio_receiver)
+            else:
+                logger.error('No se ha unido a ningún canal de voz')
+                await ctx.send('❌ No se ha unido a ningún canal de voz')
+                
 
         except Exception as e:
             logger.error(f'Error al iniciar la grabación: {e}')

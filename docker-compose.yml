@@ -1,12 +1,12 @@
-# docker-compose.yml
-version: '3.8'
-
 services:
   discord-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
       - ./google_credentials.json:/app/google_credentials.json:ro
       - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
     environment:
       - GOOGLE_APPLICATION_CREDENTIALS=/app/google_credentials.json
     restart: unless-stopped
@@ -15,3 +15,15 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0) if __import__('os').path.exists('/app/config.json') else sys.exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

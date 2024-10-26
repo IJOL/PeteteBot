@@ -144,10 +144,12 @@ class TranscriberCog(commands.Cog):
         try:
             if not ctx.voice_client:
                 await ctx.send('❌ ¡Necesito estar en un canal de voz!')
+                logger.error('Bot no conectado a ningún canal de voz')
                 return
 
             if ctx.guild.id in self.recording:
                 await ctx.send('⚠️ ¡Ya estoy grabando!')
+                logger.warning('Bot ya está grabando en este servidor')
                 return
 
             self.recording[ctx.guild.id] = True
@@ -168,7 +170,8 @@ class TranscriberCog(commands.Cog):
                         asyncio.create_task(handler.process_audio_buffer(handler.current_segment))
                         handler.current_segment = []
 
-            ctx.voice_client.listen(audio_receiver)
+            # Reemplazar ctx.voice_client.listen(audio_receiver) con el método correcto
+            ctx.voice_client.recv_voice_packet(audio_receiver)
 
         except Exception as e:
             logger.error(f'Error al iniciar la grabación: {e}')

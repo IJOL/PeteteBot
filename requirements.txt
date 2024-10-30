@@ -1,5 +1,6 @@
 # requirements.txt
-discord.py==2.3.2
+#discord.py==2.3.2
+py-cord[voice]
 google-cloud-speech==2.24.1
 pydub==0.25.1
 webrtcvad-wheels==2.0.11

@@ -1,20 +1,19 @@
 import discord
-from discord.ext import commands
-import asyncio
-import webrtcvad
-import numpy as np
-from google.cloud import speech_v1
-from pydub import AudioSegment
 import json
 import logging
+from google.cloud import speech_v1
+from pydub import AudioSegment
+import webrtcvad
+import asyncio
 
-# Configurar logging
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('TranscriberBot')
 
+# Configuration loading
 class Config:
     def __init__(self):
         self.load_config()
@@ -24,207 +23,136 @@ class Config:
             with open('config.json', 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 self.token = config['token']
-                self.prefix = config.get('prefix', '!')
                 self.language = config.get('language', 'es-ES')
                 self.vad_aggressiveness = config.get('vad_aggressiveness', 3)
                 self.silence_duration = config.get('silence_duration', 900)  # ms
                 self.sample_rate = config.get('sample_rate', 16000)
-                logger.info('Configuración cargada exitosamente')
+                logger.info('Configuration loaded successfully')
         except Exception as e:
-            logger.error(f'Error al cargar la configuración: {e}')
+            logger.error(f'Error loading configuration: {e}')
             raise
 
-class AudioProcessor:
+# Transcriber bot
+class TranscriberBot:
     def __init__(self, config):
+        self.config = config
+        self.speech_client = speech_v1.SpeechClient()
+        self.audio_buffer = []
+        self.channel = None
+
+    def set_channel(self, channel):
+        self.channel = channel
+
+    def transcribe_audio(self, audio_data):
+        audio = speech_v1.RecognitionAudio(content=audio_data)
+        config = speech_v1.RecognitionConfig(
+            encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=self.config.sample_rate,
+            language_code=self.config.language
+        )
+
+        response = self.speech_client.recognize(config=config, audio=audio)
+        for result in response.results:
+            transcription = result.alternatives[0].transcript
+            logger.info(f'Transcription: {transcription}')
+            if self.channel:
+                asyncio.run_coroutine_threadsafe(self.channel.send(transcription), asyncio.get_event_loop())
+
+# Audio processor
+class AudioProcessor:
+    def __init__(self, config, transcriber_bot):
         self.vad = webrtcvad.Vad(config.vad_aggressiveness)
         self.sample_rate = config.sample_rate
         self.frame_duration = 30  # ms
         self.frame_size = int(self.sample_rate * self.frame_duration / 1000)
         self.silence_frames = 0
         self.max_silence_frames = config.silence_duration // self.frame_duration
+        self.transcriber_bot = transcriber_bot
 
     def process_audio(self, audio_chunk):
-        try:
-            is_speech = self.vad.is_speech(audio_chunk, self.sample_rate)
-            return is_speech
-        except Exception as e:
-            logger.error(f'Error procesando audio: {e}')
-            return False
+        self.transcriber_bot.audio_buffer.append(audio_chunk)
+        total_audio_length = len(b''.join(self.transcriber_bot.audio_buffer))
 
-class VoiceTranscriberBot(commands.Bot):
-    def __init__(self, config):
-        intents = discord.Intents.default()
-        intents.voice_states = True
-        intents.message_content = True
-        super().__init__(command_prefix=config.prefix, intents=intents)
-        
-        self.config = config
-        self.speech_client = speech_v1.SpeechClient()
-        self.audio_processors = {}
-        self.recording_channels = set()
-
-    async def setup_hook(self):
-        await self.add_cog(TranscriberCog(self))
-        logger.info('Bot inicializado y listo')
-
-class AudioSegmentHandler:
-    def __init__(self, bot, channel):
-        self.bot = bot
-        self.channel = channel
-        self.current_segment = []
-        self.processor = AudioProcessor(bot.config)
-        
-    async def process_audio_buffer(self, audio_data):
-        if len(audio_data) == 0:
+        if total_audio_length < self.frame_size:
             return
 
-        try:
-            audio_segment = AudioSegment(
-                data=b''.join(audio_data),
-                sample_width=2,
-                frame_rate=48000,
-                channels=2
-            )
-            
-            audio_segment = audio_segment.set_channels(1).set_frame_rate(self.bot.config.sample_rate)
-            await self.transcribe_segment(audio_segment)
-        except Exception as e:
-            logger.error(f'Error procesando buffer de audio: {e}')
-            
-    async def transcribe_segment(self, audio_segment):
-        try:
-            audio_content = audio_segment.raw_data
-            audio = speech_v1.RecognitionAudio(content=audio_content)
-            
-            config = speech_v1.RecognitionConfig(
-                encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=self.bot.config.sample_rate,
-                language_code=self.bot.config.language,
-                enable_automatic_punctuation=True,
-            )
-            
-            response = self.bot.speech_client.recognize(config=config, audio=audio)
-            
-            for result in response.results:
-                transcript = result.alternatives[0].transcript
-                if transcript.strip():
-                    await self.channel.send(f'Transcripción: {transcript}')
-                    logger.info(f'Transcripción exitosa: {transcript[:50]}...')
-        
-        except Exception as e:
-            logger.error(f'Error en la transcripción: {e}')
-            await self.channel.send('❌ Error al procesar el audio')
+        is_speech = self.vad.is_speech(audio_chunk[:self.frame_size], self.sample_rate)
 
-class TranscriberCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.recording = {}
-        self.segment_handlers = {}
-        self.channel = None
+        if is_speech:
+            self.silence_frames = 0
+        else:
+            self.silence_frames += 1
+            if self.silence_frames > self.max_silence_frames and self.transcriber_bot.audio_buffer:
+                self.transcribe_audio()
+                self.transcriber_bot.audio_buffer = []
+                self.silence_frames = 0
 
-    @commands.command()
-    async def join(self, ctx):
-        try:
-            if ctx.author.voice:
-                channel = ctx.author.voice.channel
-                if ctx.voice_client is None:
-                    self.channel = await channel.connect()
-                else:
-                    await ctx.voice_client.move_to(channel)
-                self.segment_handlers[ctx.guild.id] = AudioSegmentHandler(self.bot, ctx.channel)
-                await ctx.send('✅ ¡Conectado y listo para transcribir!')
-                logger.info(f'Bot unido al canal de voz en {ctx.guild.name}')
-            else:
-                await ctx.send('❌ Necesitas estar en un canal de voz.')
-        except Exception as e:
-            logger.error(f'Error al unirse al canal: {e}')
-            await ctx.send('❌ Error al unirse al canal de voz')
+    def transcribe_audio(self):
+        audio_data = b''.join(self.transcriber_bot.audio_buffer)
+        audio_segment = AudioSegment(
+            data=audio_data,
+            sample_width=2,
+            frame_rate=self.sample_rate,
+            channels=1
+        )
+        audio_bytes = audio_segment.raw_data
+        self.transcriber_bot.transcribe_audio(audio_bytes)
 
-    @commands.command()
-    async def start(self, ctx):
-        try:
-            if not ctx.voice_client:
-                await ctx.send('❌ ¡Necesito estar en un canal de voz!')
-                logger.error('Bot no conectado a ningún canal de voz')
-                return
+# Custom sink for real-time processing
+class MySink(discord.sinks.Sink):
+    def __init__(self, config, transcriber_bot):
+        super().__init__()
+        self.processor = AudioProcessor(config, transcriber_bot)
 
-            if ctx.guild.id in self.recording:
-                await ctx.send('⚠️ ¡Ya estoy grabando!')
-                logger.warning('Bot ya está grabando en este servidor')
-                return
+    def write(self, data, user):
+        self.processor.process_audio(data)
 
-            self.recording[ctx.guild.id] = True
-            await ctx.send('🎙️ ¡Comenzando a transcribir! Detectaré automáticamente cuando alguien hable.')
-            logger.info(f'Iniciando grabación en {ctx.guild.name}')
+    async def cleanup(self):
+        if self.processor.transcriber_bot.audio_buffer:
+            self.processor.transcribe_audio()
 
-            handler = self.segment_handlers[ctx.guild.id]
-            
-            def audio_receiver(user, audio_data):
-                if handler.processor.process_audio(audio_data):
-                    handler.current_segment.append(audio_data)
-                    handler.processor.silence_frames = 0
-                else:
-                    handler.processor.silence_frames += 1
-                    
-                    if (handler.processor.silence_frames >= handler.processor.max_silence_frames 
-                        and handler.current_segment):
-                        asyncio.create_task(handler.process_audio_buffer(handler.current_segment))
-                        handler.current_segment = []
-            if self.channel:
-                self.channel.listen(audio_receiver)
-            else:
-                logger.error('No se ha unido a ningún canal de voz')
-                await ctx.send('❌ No se ha unido a ningún canal de voz')
-                
+# Discord bot setup
+bot = discord.Bot()
+connections = {}
+config = Config()
+transcriber_bot = TranscriberBot(config)
 
-        except Exception as e:
-            logger.error(f'Error al iniciar la grabación: {e}')
-            await ctx.send('❌ Error al iniciar la grabación')
+async def finished_callback(sink, channel: discord.TextChannel, *args):
+    recorded_users = [f"<@{user_id}>" for user_id, audio in sink.audio_data.items()]
+    await sink.vc.disconnect()
+    await channel.send(f"Finished! Recorded audio for {', '.join(recorded_users)}.")
 
-    @commands.command()
-    async def stop(self, ctx):
-        try:
-            if ctx.guild.id not in self.recording:
-                await ctx.send('⚠️ ¡No estoy grabando!')
-                return
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is ready and online!")
 
-            handler = self.segment_handlers[ctx.guild.id]
-            if handler.current_segment:
-                await handler.process_audio_buffer(handler.current_segment)
-            
-            ctx.voice_client.stop_listening()
-            del self.recording[ctx.guild.id]
-            await ctx.send('🛑 ¡Transcripción detenida!')
-            logger.info(f'Grabación detenida en {ctx.guild.name}')
+@bot.slash_command(name="start", description="Start recording")
+async def start(ctx: discord.ApplicationContext):
+    voice = ctx.author.voice
 
-        except Exception as e:
-            logger.error(f'Error al detener la grabación: {e}')
-            await ctx.send('❌ Error al detener la grabación')
+    if not voice:
+        return await ctx.respond("You're not in a vc right now")
 
-    @commands.command()
-    async def leave(self, ctx):
-        try:
-            if ctx.voice_client:
-                if ctx.guild.id in self.recording:
-                    ctx.voice_client.stop_listening()
-                    del self.recording[ctx.guild.id]
-                await ctx.voice_client.disconnect()
-                await ctx.send('👋 ¡Desconectado del canal de voz!')
-                logger.info(f'Bot desconectado en {ctx.guild.name}')
-            else:
-                await ctx.send('⚠️ No estoy conectado a ningún canal de voz.')
+    vc = await voice.channel.connect()
+    connections.update({ctx.guild.id: vc})
+    transcriber_bot.set_channel(ctx.channel)
 
-        except Exception as e:
-            logger.error(f'Error al desconectar: {e}')
-            await ctx.send('❌ Error al desconectar')
+    vc.start_recording(
+        MySink(config, transcriber_bot),
+        finished_callback,
+        ctx.channel,
+    )
 
-def main():
-    try:
-        config = Config()
-        bot = VoiceTranscriberBot(config)
-        bot.run(config.token)
-    except Exception as e:
-        logger.critical(f'Error crítico al iniciar el bot: {e}')
+    await ctx.respond("The recording has started!")
 
-if __name__ == "__main__":
-    main()
+@bot.slash_command(name="stop", description="Stop recording")
+async def stop(ctx: discord.ApplicationContext):
+    if ctx.guild.id in connections:
+        vc = connections[ctx.guild.id]
+        vc.stop_recording()
+        del connections[ctx.guild.id]
+        await ctx.delete()
+    else:
+        await ctx.respond("Not recording in this guild.")
+
+bot.run(config.token)

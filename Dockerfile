@@ -22,10 +22,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar el código del bot
 COPY . .
-
 # Crear un usuario no root para ejecutar el bot
 RUN useradd -m botuser
+RUN chown -R botuser:botuser /app
+RUN mkdir /app/temp_audio && chown botuser:botuser /app/temp_audio
+
 USER botuser
+
 
 # Comando para ejecutar el bot
 CMD ["python", "bot.py"]

@@ -1,3 +1,7 @@
+volumes:
+  temp:
+  logs:
+
 services:
   discord-bot:
     build:

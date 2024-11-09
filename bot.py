@@ -1,158 +1,255 @@
 import discord
+import webrtcvad
+import asyncio
+import wave
+import os
 import json
 import logging
 from google.cloud import speech_v1
-from pydub import AudioSegment
-import webrtcvad
-import asyncio
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('TranscriberBot')
-
-# Configuration loading
+from google.cloud import translate_v2
+from google.oauth2 import service_account
+from discord.sinks import Sink
+import numpy as np
+from pathlib import Path
 class Config:
-    def __init__(self):
-        self.load_config()
-
-    def load_config(self):
+    def __init__(self, config_path='config.json'):
+        """Load configuration from JSON file"""
         try:
-            with open('config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                self.token = config['token']
-                self.language = config.get('language', 'es-ES')
-                self.vad_aggressiveness = config.get('vad_aggressiveness', 3)
-                self.silence_duration = config.get('silence_duration', 900)  # ms
-                self.sample_rate = config.get('sample_rate', 16000)
-                logger.info('Configuration loaded successfully')
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+                
+            # Create required directories
+            Path(self.get('paths.temp_audio_dir')).mkdir(exist_ok=True)
+            Path(self.get('paths.logs_dir')).mkdir(exist_ok=True)
+            
+            # Setup logging
+            # Setup logging to both stdout and a file
+            log_file = Path(self.get('paths.logs_dir')) / 'bot.log'
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                handlers=[
+                    logging.StreamHandler(),
+                    logging.FileHandler(log_file)
+                ]
+            )
+              
         except Exception as e:
-            logger.error(f'Error loading configuration: {e}')
+            print(f"Error loading config: {e}")
             raise
+    
+    def get(self, path, default=None):
+        """Get configuration value using dot notation"""
+        try:
+            value = self.config
+            for key in path.split('.'):
+                value = value[key]
+            return value
+        except (KeyError, TypeError):
+            return default
 
-# Transcriber bot
-class TranscriberBot:
+class VoiceTranslatorSink(Sink):
     def __init__(self, config):
-        self.config = config
-        self.speech_client = speech_v1.SpeechClient()
-        self.audio_buffer = []
-        self.channel = None
-
-    def set_channel(self, channel):
-        self.channel = channel
-
-    def transcribe_audio(self, audio_data):
-        audio = speech_v1.RecognitionAudio(content=audio_data)
-        config = speech_v1.RecognitionConfig(
-            encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=self.config.sample_rate,
-            language_code=self.config.language
-        )
-
-        response = self.speech_client.recognize(config=config, audio=audio)
-        for result in response.results:
-            transcription = result.alternatives[0].transcript
-            logger.info(f'Transcription: {transcription}')
-            if self.channel:
-                asyncio.run_coroutine_threadsafe(self.channel.send(transcription), asyncio.get_event_loop())
-
-# Audio processor
-class AudioProcessor:
-    def __init__(self, config, transcriber_bot):
-        self.vad = webrtcvad.Vad(config.vad_aggressiveness)
-        self.sample_rate = config.sample_rate
-        self.frame_duration = 30  # ms
-        self.frame_size = int(self.sample_rate * self.frame_duration / 1000)
-        self.silence_frames = 0
-        self.max_silence_frames = config.silence_duration // self.frame_duration
-        self.transcriber_bot = transcriber_bot
-
-    def process_audio(self, audio_chunk):
-        self.transcriber_bot.audio_buffer.append(audio_chunk)
-        total_audio_length = len(b''.join(self.transcriber_bot.audio_buffer))
-
-        if total_audio_length < self.frame_size:
-            return
-
-        is_speech = self.vad.is_speech(audio_chunk[:self.frame_size], self.sample_rate)
-
-        if is_speech:
-            self.silence_frames = 0
-        else:
-            self.silence_frames += 1
-            if self.silence_frames > self.max_silence_frames and self.transcriber_bot.audio_buffer:
-                self.transcribe_audio()
-                self.transcriber_bot.audio_buffer = []
-                self.silence_frames = 0
-
-    def transcribe_audio(self):
-        audio_data = b''.join(self.transcriber_bot.audio_buffer)
-        audio_segment = AudioSegment(
-            data=audio_data,
-            sample_width=2,
-            frame_rate=self.sample_rate,
-            channels=1
-        )
-        audio_bytes = audio_segment.raw_data
-        self.transcriber_bot.transcribe_audio(audio_bytes)
-
-# Custom sink for real-time processing
-class MySink(discord.sinks.Sink):
-    def __init__(self, config, transcriber_bot):
         super().__init__()
-        self.processor = AudioProcessor(config, transcriber_bot)
+        self.config = config
+        self.logger = logging.getLogger('VoiceTranslatorSink')
+        
+        # Initialize VAD
+        self.vad = webrtcvad.Vad(config.get('voice.vad_aggressiveness'))
+        
+        # Load Google credentials
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                config.get('google.credentials_path'),
+                scopes=[
+                    'https://www.googleapis.com/auth/cloud-platform',
+                    'https://www.googleapis.com/auth/speech',
+                    'https://www.googleapis.com/auth/cloud-translation'
+                ]
+            )
+            
+            self.speech_client = speech_v1.SpeechClient(credentials=credentials)
+            self.translate_client = translate_v2.Client(credentials=credentials)
+            
+        except Exception as e:
+            self.logger.error(f"Error loading Google credentials: {e}")
+            raise
+        
+        # Initialize audio processing parameters
+        self.buffer = []
+        self.speaking_buffer = []
+        self.silence_duration = 0
+        self.is_speaking = False
+        
+        self.RATE = config.get('voice.sample_rate')
+        self.CHUNK_DURATION_MS = config.get('voice.chunk_duration_ms')
+        self.CHUNK_SIZE = int(self.RATE * self.CHUNK_DURATION_MS / 1000)
+        self.SILENCE_THRESHOLD = config.get('voice.silence_threshold')
+    
+    async def _process_utterance(self, audio_data, user):
+        """Process a complete utterance with language autodetection"""
+        temp_filename = Path(self.config.get('paths.temp_audio_dir')) / f"temp_{user.id}.wav"
+        
+        try:
+            # Save audio to WAV file
+            with wave.open(str(temp_filename), 'wb') as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(self.RATE)
+                wf.writeframes(audio_data)
+            
+            # Read audio content
+            with open(temp_filename, 'rb') as audio_file:
+                content = audio_file.read()
+            
+            # Configure speech recognition with language detection
+            audio = speech_v1.RecognitionAudio(content=content)
+            config = speech_v1.RecognitionConfig(
+                encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=self.RATE,
+                language_code="es-ES",  # Primary language
+                alternative_language_codes=["en-US"],  # Alternative language
+                model="default"
+            )
+            
+            # Perform speech recognition
+            response = self.speech_client.recognize(config=config, audio=audio)
+            
+            if not response.results:
+                return
+            
+            # Get transcript and detected language
+            transcript = response.results[0].alternatives[0].transcript
+            detected_language = response.results[0].language_code.split('-')[0]  # Get 'en' or 'es'
+            
+            # Get target language based on detected language
+            translation_config = self.config.get(f'google.translation.{detected_language}')
+            if not translation_config:
+                self.logger.error(f"Unsupported detected language: {detected_language}")
+                return
+                
+            target_language = translation_config['target']
+            
+            # Translate text
+            translation = self.translate_client.translate(
+                transcript,
+                target_language=target_language
+            )
+            
+            # Create message with language indicators
+            message_content = (
+                f"User: {user.name}\n"
+                f"Detected Language: {translation_config['name']}\n"
+                f"Original: {transcript}\n"
+                f"Translated: {translation['translatedText']}"
+            )
+            
+            # Send or update Discord message
+            if hasattr(self, 'bot_message'):
+                await self.bot_message.edit(content=message_content)
+            else:
+                self.bot_message = await self.voice_client.channel.send(message_content)
+                
+        except Exception as e:
+            self.logger.error(f"Error processing utterance: {e}")
+            if hasattr(self, 'bot_message'):
+                await self.bot_message.edit(content=f"Error processing speech: {str(e)}")
+            
+        finally:
+            if temp_filename.exists():
+                temp_filename.unlink()
 
     def write(self, data, user):
-        self.processor.process_audio(data)
+        try:
+            pcm_data = np.frombuffer(data, dtype=np.int16)
+            resampled_data = self._resample(pcm_data, self.RATE, 16000)
+            is_speech = self.vad.is_speech(resampled_data.tobytes(), 16000)
+            
+            if is_speech:
+                self.silence_duration = 0
+                self.speaking_buffer.extend(data)
+                self.is_speaking = True
+            else:
+                self.silence_duration += 1
+                
+                if self.silence_duration >= self.SILENCE_THRESHOLD and self.is_speaking:
+                    asyncio.create_task(self._process_utterance(bytes(self.speaking_buffer), user))
+                    self.speaking_buffer = []
+                    self.is_speaking = False
+                    
+        except Exception as e:
+            self.logger.error(f"Error in write method: {e}")
 
-    async def cleanup(self):
-        if self.processor.transcriber_bot.audio_buffer:
-            self.processor.transcribe_audio()
+    def _resample(self, audio_data, orig_rate, target_rate):
+        """Resample audio data to target rate"""
+        duration = len(audio_data) / orig_rate
+        target_length = int(duration * target_rate)
+        return np.interp(
+            np.linspace(0, duration, target_length),
+            np.linspace(0, duration, len(audio_data)),
+            audio_data
+        ).astype(np.int16)
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.speech_client = None
+        self.translate_client = None
 
-# Discord bot setup
-bot = discord.Bot()
-connections = {}
-config = Config()
-transcriber_bot = TranscriberBot(config)
+class VoiceTranslatorBot(discord.Bot):
+    def __init__(self, config_path='config.json'):
+        self.config = Config(config_path)
+        super().__init__(
+            description=self.config.get('bot.description')
+        )
+        self.logger = logging.getLogger('VoiceTranslatorBot')
+        self.connections = {}
+    
+    async def start_recording(self, voice_client):
+        """Start recording and translating voice in a voice channel"""
+        sink = VoiceTranslatorSink(self.config)
+        voice_client.start_recording(sink)
+        self.connections[voice_client.guild.id] = voice_client
+    
+    async def stop_recording(self, guild_id):
+        """Stop recording in a specific guild"""
+        if guild_id in self.connections:
+            voice_client = self.connections[guild_id]
+            voice_client.stop_recording()
+            del self.connections[guild_id]
 
-async def finished_callback(sink, channel: discord.TextChannel, *args):
-    recorded_users = [f"<@{user_id}>" for user_id, audio in sink.audio_data.items()]
-    await sink.vc.disconnect()
-    await channel.send(f"Finished! Recorded audio for {', '.join(recorded_users)}.")
+def setup_commands(bot):
+    @bot.slash_command(name="join", description="Join your voice channel and start translating")
+    async def join(ctx):
+        if not ctx.author.voice:
+            await ctx.respond("You need to be in a voice channel!")
+            return
+        
+        voice_client = await ctx.author.voice.channel.connect()
+        await bot.start_recording(voice_client)
+        await ctx.respond(
+            "Joined voice channel and started translating!\n"
+            "I will automatically detect whether you speak in English or Spanish "
+            "and translate to the other language."
+        )
 
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is ready and online!")
+    @bot.slash_command(name="leave", description="Leave the voice channel")
+    async def leave(ctx):
+        if not ctx.voice_client:
+            await ctx.respond("I'm not in a voice channel!")
+            return
+        
+        await bot.stop_recording(ctx.guild.id)
+        await ctx.voice_client.disconnect()
+        await ctx.respond("Left voice channel!")
 
-@bot.slash_command(name="start", description="Start recording")
-async def start(ctx: discord.ApplicationContext):
-    voice = ctx.author.voice
-
-    if not voice:
-        return await ctx.respond("You're not in a vc right now")
-
-    vc = await voice.channel.connect()
-    connections.update({ctx.guild.id: vc})
-    transcriber_bot.set_channel(ctx.channel)
-
-    vc.start_recording(
-        MySink(config, transcriber_bot),
-        finished_callback,
-        ctx.channel,
-    )
-
-    await ctx.respond("The recording has started!")
-
-@bot.slash_command(name="stop", description="Stop recording")
-async def stop(ctx: discord.ApplicationContext):
-    if ctx.guild.id in connections:
-        vc = connections[ctx.guild.id]
-        vc.stop_recording()
-        del connections[ctx.guild.id]
-        await ctx.delete()
-    else:
-        await ctx.respond("Not recording in this guild.")
-
-bot.run(config.token)
+if __name__ == "__main__":
+    try:
+        # Initialize bot with config
+        bot = VoiceTranslatorBot('config.json')
+        setup_commands(bot)
+        
+        # Run bot
+        bot.run(bot.config.get('bot.token'))
+        
+    except Exception as e:
+        logging.error(f"Error running bot: {e}")

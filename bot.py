@@ -11,6 +11,9 @@ from google.oauth2 import service_account
 from discord.sinks import Sink
 import numpy as np
 from pathlib import Path
+import contextlib
+import collections
+
 class Config:
     def __init__(self, config_path='config.json'):
         """Load configuration from JSON file"""
@@ -22,22 +25,24 @@ class Config:
             Path(self.get('paths.temp_audio_dir')).mkdir(exist_ok=True)
             Path(self.get('paths.logs_dir')).mkdir(exist_ok=True)
             
-            # Setup logging
             # Setup logging to both stdout and a file
             log_file = Path(self.get('paths.logs_dir')) / 'bot.log'
+            log_level = self.get('logging.level', 'INFO')
+            log_format = self.get('logging.format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            
             logging.basicConfig(
-                level=logging.INFO,
-                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                level=getattr(logging, log_level.upper()),
+                format=log_format,
                 handlers=[
                     logging.StreamHandler(),
                     logging.FileHandler(log_file)
                 ]
             )
-              
+            
         except Exception as e:
             print(f"Error loading config: {e}")
             raise
-    
+
     def get(self, path, default=None):
         """Get configuration value using dot notation"""
         try:
@@ -47,6 +52,87 @@ class Config:
             return value
         except (KeyError, TypeError):
             return default
+
+class Frame(object):
+    """Represents a "frame" of audio data."""
+    def __init__(self, bytes, timestamp, duration):
+        self.bytes = bytes
+        self.timestamp = timestamp
+        self.duration = duration
+
+def frame_generator(frame_duration_ms, audio, sample_rate, config):
+    """Generates audio frames from PCM audio data."""
+    logger = logging.getLogger('frame_generator')
+    
+    # Configure logger based on config
+    if config.get('logging.frame_generator.enabled', False):
+        logger.setLevel(getattr(logging, 
+            config.get('logging.frame_generator.level', 'INFO').upper()))
+    else:
+        logger.setLevel(logging.WARNING)
+    
+    n = int(sample_rate * (frame_duration_ms / 1000.0) * 2)
+    offset = 0
+    timestamp = 0.0
+    duration = (float(n) / sample_rate) / 2.0
+    
+    logger.debug(f"Initialized with frame_duration_ms={frame_duration_ms}, sample_rate={sample_rate}")
+    
+    while offset + n < len(audio):
+        frame = Frame(audio[offset:offset + n], timestamp, duration)
+        logger.debug(f"Generated frame: timestamp={timestamp:.3f}s, duration={duration:.3f}s")
+        yield frame
+        timestamp += duration
+        offset += n
+
+def vad_collector(sample_rate, frame_duration_ms, padding_duration_ms, vad, frames, config):
+    """Filters out non-voiced audio frames."""
+    logger = logging.getLogger('vad_collector')
+    
+    # Configure logger based on config
+    if config.get('logging.vad_collector.enabled', False):
+        logger.setLevel(getattr(logging, 
+            config.get('logging.vad_collector.level', 'INFO').upper()))
+    else:
+        logger.setLevel(logging.WARNING)
+    
+    num_padding_frames = int(padding_duration_ms / frame_duration_ms)
+    ring_buffer = collections.deque(maxlen=num_padding_frames)
+    triggered = False
+    voiced_frames = []
+    
+    logger.debug(f"Initialized with sample_rate={sample_rate}, frame_duration_ms={frame_duration_ms}")
+    
+    for frame in frames:
+        is_speech = vad.is_speech(frame.bytes, sample_rate)
+        logger.debug(f"Frame speech detection: timestamp={frame.timestamp:.3f}s, is_speech={is_speech}")
+        
+        if not triggered:
+            ring_buffer.append(frame)
+            num_voiced = len([f for f in ring_buffer if vad.is_speech(f.bytes, sample_rate)])
+            logger.debug(f"Not triggered: buffer_size={len(ring_buffer)}, num_voiced={num_voiced}")
+            
+            if num_voiced > 0.9 * ring_buffer.maxlen:
+                logger.info("Voice detected - starting collection")
+                triggered = True
+                voiced_frames.extend(ring_buffer)
+                ring_buffer.clear()
+        else:
+            voiced_frames.append(frame)
+            ring_buffer.append(frame)
+            num_unvoiced = len([f for f in ring_buffer if not vad.is_speech(f.bytes, sample_rate)])
+            logger.debug(f"Triggered: buffer_size={len(ring_buffer)}, num_unvoiced={num_unvoiced}")
+            
+            if num_unvoiced > 0.9 * ring_buffer.maxlen:
+                logger.info("Voice ended - yielding segment")
+                triggered = False
+                yield b''.join([f.bytes for f in voiced_frames])
+                ring_buffer.clear()
+                voiced_frames = []
+
+    if voiced_frames:
+        logger.debug("Yielding final voice segment")
+        yield b''.join([f.bytes for f in voiced_frames])
 
 class VoiceTranslatorSink(Sink):
     def __init__(self, config):
@@ -93,7 +179,7 @@ class VoiceTranslatorSink(Sink):
         try:
             # Save audio to WAV file
             with wave.open(str(temp_filename), 'wb') as wf:
-                wf.setnchannels(2)
+                wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(self.RATE)
                 wf.writeframes(audio_data)
@@ -161,24 +247,21 @@ class VoiceTranslatorSink(Sink):
 
     def write(self, data, user):
         try:
-            pcm_data = np.frombuffer(data, dtype=np.int16)
-            resampled_data = self._resample(pcm_data, self.RATE, 16000)
-            is_speech = self.vad.is_speech(resampled_data.tobytes(), 16000)
-            
-            if is_speech:
-                self.silence_duration = 0
-                self.speaking_buffer.extend(data)
-                self.is_speaking = True
-            else:
-                self.silence_duration += 1
+            self.logger.debug(f"Received data from user {user}")
+            frames = frame_generator(self.CHUNK_DURATION_MS, data, self.RATE, self.config)
+            segments = vad_collector(
+                self.RATE, 
+                self.CHUNK_DURATION_MS, 
+                self.SILENCE_THRESHOLD, 
+                self.vad, 
+                frames,
+                self.config
+            )            
+            for segment in segments:
+                asyncio.create_task(self._process_utterance(segment, user))
                 
-                if self.silence_duration >= self.SILENCE_THRESHOLD and self.is_speaking:
-                    asyncio.create_task(self._process_utterance(bytes(self.speaking_buffer), user))
-                    self.speaking_buffer = []
-                    self.is_speaking = False
-                    
         except Exception as e:
-            self.logger.error(f"Error in write method: {e}")
+            self.logger.error(f"Error in write method: {e}, user: {user}")
 
     def _resample(self, audio_data, orig_rate, target_rate):
         """Resample audio data to target rate"""
@@ -207,7 +290,7 @@ class VoiceTranslatorBot(discord.Bot):
     async def start_recording(self, voice_client):
         """Start recording and translating voice in a voice channel"""
         sink = VoiceTranslatorSink(self.config)
-        voice_client.start_recording(sink)
+        voice_client.start_recording(sink, self.finished_callback)
         self.connections[voice_client.guild.id] = voice_client
     
     async def stop_recording(self, guild_id):
@@ -216,6 +299,10 @@ class VoiceTranslatorBot(discord.Bot):
             voice_client = self.connections[guild_id]
             voice_client.stop_recording()
             del self.connections[guild_id]
+    
+    async def finished_callback(self, sink, *args):
+        """Callback function when recording is finished"""
+        self.logger.info("Recording finished")
 
 def setup_commands(bot):
     @bot.slash_command(name="join", description="Join your voice channel and start translating")

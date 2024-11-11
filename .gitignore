@@ -1,2 +1,5 @@
 *.json
 .idea
+venv
+temp_audio
+logs

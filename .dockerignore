@@ -8,3 +8,6 @@ __pycache__
 *.log
 google_credentials.json
 config.json
+venv
+logs
+temp_audio

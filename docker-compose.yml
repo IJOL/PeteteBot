@@ -1,7 +1,3 @@
-volumes:
-  temp:
-  logs:
-
 services:
   discord-bot:
     build:
@@ -10,8 +6,6 @@ services:
     volumes:
       - ./google_credentials.json:/app/google_credentials.json:ro
       - ./config.json:/app/config.json:ro
-    environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/google_credentials.json
     restart: unless-stopped
     logging:
       driver: json-file

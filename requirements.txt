@@ -1,8 +1,5 @@
 # requirements.txt
-#discord.py==2.3.2
-py-cord[voice]
 pydub==0.25.1
-webrtcvad-wheels==2.0.11
 py-cord[voice]>=2.4.0
 google-cloud-speech>=2.0.0
 google-cloud-translate>=3.0.0
@@ -11,3 +8,5 @@ numpy>=1.21.0
 pathlib>=1.0.1
 asyncio>=3.4.3
 setuptools>=57.4.0
+scipy==1.7.1
+py-audio

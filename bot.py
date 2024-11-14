@@ -3,15 +3,14 @@ from discord.sinks import Sink
 import asyncio
 import json
 import logging
-import os
-from pathlib import Path
 from google.cloud import speech_v1
 from google.cloud import translate_v2
 from google.oauth2 import service_account
-import queue
 from typing import Dict, Optional
 import numpy as np
 import scipy.signal
+import threading
+import queue
 
 class Config:
     def __init__(self, config_path='config.json'):
@@ -34,28 +33,24 @@ class Config:
         return current
 
 class AudioBuffer:
-    def __init__(self, user_id: int, buffer_size: int = 480000):  # 10 segundos a 48kHz
+    def __init__(self, user_id: int):
         self.user_id = user_id
-        self.buffer = bytearray()
-        self.buffer_size = buffer_size
-        self.ready = asyncio.Event()
         self.active = True
+        self.logger = logging.getLogger(f'AudioBuffer-{user_id}')
+        self.audio_queue = queue.Queue()
+        self.logger.info(f"Creado nuevo buffer de audio para usuario {user_id}")
 
-    def add_audio(self, data: bytes) -> bool:
+    def add_audio(self, data: bytes) -> None:
+        self.logger.debug(f"Añadiendo audio de tamaño {len(data)}")
         resampled_data = self.resample_audio(data)
-        self.buffer.extend(resampled_data)
-        if len(self.buffer) >= self.buffer_size:
-            self.ready.set()
-            return True
-        return False
+        self.audio_queue.put(resampled_data)
 
     def get_audio(self) -> bytes:
-        audio = bytes(self.buffer)
-        self.buffer.clear()
-        self.ready.clear()
-        return audio
+        self.logger.debug("Obteniendo audio de la cola")
+        return self.audio_queue.get()
 
     def resample_audio(self, audio: bytes, original_rate: int = 48000, target_rate: int = 16000) -> bytes:
+        self.logger.debug(f"Resampleando audio de {original_rate}Hz a {target_rate}Hz")
         audio_np = np.frombuffer(audio, dtype=np.int16)
         resampled_audio = scipy.signal.resample_poly(audio_np, target_rate, original_rate)
         return resampled_audio.astype(np.int16).tobytes()
@@ -67,7 +62,7 @@ class VoiceTranscriptionSink(Sink):
         self.text_channel = None
         self.logger = logging.getLogger('VoiceTranscriptionSink')
         self.user_buffers: Dict[int, AudioBuffer] = {}
-        self.processing_tasks: Dict[int, asyncio.Task] = {}
+        self.processing_threads: Dict[int, threading.Thread] = {}
         self.user_clients: Dict[int, speech_v1.SpeechClient] = {}
         
         credentials = service_account.Credentials.from_service_account_file(
@@ -92,26 +87,29 @@ class VoiceTranscriptionSink(Sink):
         )
 
     def write(self, data: bytes, user_id: int) -> None:
+        self.logger.debug(f"Escribiendo datos de audio para el usuario {user_id}")
         if user_id not in self.user_buffers:
-            self.logger.info(f"Nuevo buffer para usuario {user_id}")
+            self.logger.info(f"Iniciando nuevo procesamiento de audio para usuario {user_id}")
             self.user_buffers[user_id] = AudioBuffer(user_id)
             self.user_clients[user_id] = speech_v1.SpeechClient(credentials=self.credentials)
-            self.processing_tasks[user_id] = asyncio.create_task(
-                self._process_audio(user_id)
+            self.processing_threads[user_id] = threading.Thread(
+                target=self._process_audio, args=(user_id,)
             )
+            self.processing_threads[user_id].start()
+            self.logger.info(f"Hilo de procesamiento iniciado para usuario {user_id}")
         
-        if self.user_buffers[user_id].add_audio(data):
-            self.user_buffers[user_id].ready.set()
+        self.user_buffers[user_id].add_audio(data)
 
-    async def _process_audio(self, user_id: int) -> None:
+    def _process_audio(self, user_id: int) -> None:
         buffer = self.user_buffers[user_id]
+        self.logger.info(f"Iniciando bucle de procesamiento para usuario {user_id}")
         
         while buffer.active:
-            await buffer.ready.wait()
-            
+            self.logger.info(f"Esperando datos de audio para el usuario {user_id}")
             audio_data = buffer.get_audio()
             
             try:
+                self.logger.info(f"Procesando audio para el usuario {user_id}")
                 requests = [
                     speech_v1.StreamingRecognizeRequest(audio_content=audio_data)
                 ]
@@ -120,34 +118,43 @@ class VoiceTranscriptionSink(Sink):
                     self.streaming_config,
                     requests
                 )
-
+                self.logger.info(f"Respuestas recibidas para el usuario {user_id}")
                 for response in responses:
+                    self.logger.info(f"{response}")
                     for result in response.results:
-                        if result.is_final:
-                            transcript = result.alternatives[0].transcript
-                            await self._send_transcription(user_id, transcript)
-                            
+#                        if result.is_final:
+                        transcript = result.alternatives[0].transcript
+                        self.logger.info(f"Transcripción final para el usuario {user_id}: {transcript}")
+                        self._send_transcription(user_id, transcript)
+                        
             except Exception as e:
                 self.logger.error(f"Error procesando audio para usuario {user_id}: {e}")
 
-    async def _send_transcription(self, user_id: int, text: str) -> None:
+        self.logger.info(f"Finalizando bucle de procesamiento para usuario {user_id}")
+
+    def _send_transcription(self, user_id: int, text: str) -> None:
+        self.logger.debug(f"Enviando transcripción para el usuario {user_id}")
         if self.text_channel:
             user = self.bot.get_user(user_id)
             username = user.name if user else f"Usuario {user_id}"
-            await self.text_channel.send(f"{username}: {text}")
+            asyncio.run_coroutine_threadsafe(
+                self.text_channel.send(f"{username}: {text}"), self.bot.loop
+            )
         else:
             self.logger.error("No hay canal de texto configurado")
 
     def cleanup(self) -> None:
-        for user_id in self.user_buffers:
+        self.logger.info("Iniciando limpieza de recursos del sink")
+        user_ids = list(self.user_buffers.keys())  # Hacer una copia de las claves
+        for user_id in user_ids:
             self.user_buffers[user_id].active = False
-            self.user_buffers[user_id].ready.set()
-            if user_id in self.processing_tasks:
-                self.processing_tasks[user_id].cancel()
+            if user_id in self.processing_threads:
+                self.processing_threads[user_id].join()
         
         self.user_buffers.clear()
-        self.processing_tasks.clear()
+        self.processing_threads.clear()
         self.user_clients.clear()
+        self.logger.info("Recursos del sink limpiados correctamente")
 
 class VoiceBot(discord.Bot):
     def __init__(self, config_path: str):
@@ -195,7 +202,11 @@ def setup_commands(bot):
         
         sink = VoiceTranscriptionSink(bot)
         sink.text_channel = ctx.channel
-        ctx.voice_client.start_recording(sink)
+        
+        def on_recording_finished(sink, *args):
+            sink.cleanup()
+        
+        ctx.voice_client.start_recording(sink, on_recording_finished)
         
         await ctx.respond(f"Conectado a {channel.name}")
 

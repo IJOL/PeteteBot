@@ -8,5 +8,4 @@ numpy>=1.21.0
 pathlib>=1.0.1
 asyncio>=3.4.3
 setuptools>=57.4.0
-scipy==1.7.1
-py-audio
+scipy

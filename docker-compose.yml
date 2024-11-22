@@ -12,12 +12,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
+#    deploy:
+#      resources:
+#        limits:
+#          memory: 1G
+#        reservations:
+#          memory: 512M
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0) if __import__('os').path.exists('/app/config.json') else sys.exit(1)"]
       interval: 30s
